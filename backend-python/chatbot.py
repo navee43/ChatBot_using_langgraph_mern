@@ -31,7 +31,6 @@
 # chatbot = graph.compile(checkpointer=MemorySaver())
 
 
-
 import os
 from typing import TypedDict, Annotated
 from dotenv import load_dotenv
@@ -39,11 +38,12 @@ from pymongo import MongoClient
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.mongodb import MongoDBSaver
-from langchain_core.messages import BaseMessage
+from langgraph.prebuilt import ToolNode, tools_condition
+from langchain_core.messages import BaseMessage, SystemMessage
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
+from langchain_mcp_adapters.client import MultiServerMCPClient
 
 load_dotenv()
-
 
 
 class ChatState(TypedDict):
@@ -57,19 +57,71 @@ llm = HuggingFaceEndpoint(
 )
 chatmodel = ChatHuggingFace(llm=llm)
 
+SYSTEM_PROMPT = SystemMessage(content=(
+    "You are a helpful assistant with access to tools: a web search tool "
+    "and a page-fetching tool that reads a URL's content. Use search to "
+    "find current information (news, weather, prices, facts you're unsure "
+    "of), then fetch a result's URL when you need more detail than the "
+    "search snippet gives you."
+))
 
-def chat_node(state: ChatState):
-    response = chatmodel.invoke(state["messages"])
-    return {"messages": [response]}
-
+# ---------- MCP servers ----------
+# Both run as local subprocesses (over stdio) via the Model Context
+# Protocol - no API keys needed. Building this client doesn't connect yet;
+# that happens in init_chatbot(), since MCP requires "await".
+mcp_client = MultiServerMCPClient(
+    {
+        "duckduckgo": {
+            "command": "uvx",
+            "args": ["duckduckgo-mcp-server"],
+            "transport": "stdio",
+        },
+        "fetch": {
+            "command": "uvx",
+            "args": ["mcp-server-fetch"],
+            "transport": "stdio",
+        },
+    }
+)
 
 # MongoDB Atlas replaces MemorySaver: the bot's memory now survives restarts
 client = MongoClient(os.getenv("MONGODB_URI"))
 checkpointer = MongoDBSaver(client, db_name="chatbot_app")
 
-graph = StateGraph(ChatState)
-graph.add_node("chat_node", chat_node)
-graph.add_edge(START, "chat_node")
-graph.add_edge("chat_node", END)
+# Filled in once by init_chatbot(), called at FastAPI startup (see server.py)
+chatbot = None
 
-chatbot = graph.compile(checkpointer=checkpointer)
+
+async def init_chatbot():
+    """Connect to both MCP servers, build the tool-using graph, and compile
+    it. Call this once, at startup - not per request, since it launches
+    two subprocesses."""
+    global chatbot
+
+    tools = await mcp_client.get_tools()
+    llm_with_tools = chatmodel.bind_tools(tools)
+
+    async def chat_node(state: ChatState):
+        """LLM node that may answer directly or request a tool call."""
+        response = await llm_with_tools.ainvoke([SYSTEM_PROMPT] + state["messages"])
+        return {"messages": [response]}
+
+    tool_node = ToolNode(tools)
+
+    graph = StateGraph(ChatState)
+    graph.add_node("chat_node", chat_node)
+    graph.add_node("tools", tool_node)
+
+    graph.add_edge(START, "chat_node")
+    graph.add_conditional_edges("chat_node", tools_condition)
+    graph.add_edge("tools", "chat_node")
+
+    chatbot = graph.compile(checkpointer=checkpointer)
+    return chatbot
+
+
+def retrieve_all_threads():
+    all_threads = set()
+    for checkpoint in checkpointer.list(None):
+        all_threads.add(checkpoint.config["configurable"]["thread_id"])
+    return list(all_threads)

@@ -2,5 +2,12 @@
   "dependencies": {
     "dotenv": "^18.0.1",
     "mongoose": "^9.10.1"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.5"
   }
+  ,
+  "scripts": {
+  "start": "concurrently \"uvicorn backend-python.server:app --reload\" \"npm run dev --prefix frontend\" \"node backend-node/index.js\""
+}
 }
